@@ -13,7 +13,8 @@ What it does:
   - Streams Claude response and speaks sentences as they arrive
   - Loads character prompt from prompt.txt
   - Analyzes images from /images/ directory when referenced
-  - Beautiful visual output with typewriter effect
+  - Typewriter output, strips *stage directions*
+  - ⎵ Spacebar interrupt: stops streaming + cuts current speech immediately
 
 ENV (.env next to this file):
   CLAUDE_API_KEY=sk-ant-...
@@ -36,11 +37,15 @@ import threading
 import subprocess
 import platform
 import base64
+import warnings
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 from dotenv import load_dotenv, find_dotenv
 import anthropic
+
+# silence SDK/model deprecation chatter
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 # ---------- Colors and Visual Effects ----------
 class Colors:
@@ -195,24 +200,107 @@ def find_referenced_images(text: str) -> List[Path]:
             referenced.append(image_files[0])
     return referenced
 
+# ---------- Spacebar watcher ----------
+# ---------- Spacebar watcher (robust via /dev/tty) ----------
+class SpacebarWatcher:
+    """Non-blocking listener that sets .pressed when spacebar is hit (POSIX: /dev/tty; Windows: msvcrt)."""
+    def __init__(self):
+        self.pressed = False
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        try:
+            if platform.system() == "Windows":
+                import msvcrt
+                while not self._stop.is_set():
+                    if msvcrt.kbhit():
+                        ch = msvcrt.getch()
+                        if ch in (b' ',):
+                            self.pressed = True
+                            return
+                    time.sleep(0.03)
+                return
+
+            # POSIX: read directly from controlling terminal
+            import termios, tty, select, os
+            try:
+                fd = os.open("/dev/tty", os.O_RDONLY | os.O_NONBLOCK)
+            except Exception:
+                # Fallback to stdin if /dev/tty not available
+                fd = sys.stdin.fileno()
+
+            # Save term settings (best effort)
+            old = None
+            try:
+                old = termios.tcgetattr(fd)
+            except Exception:
+                pass
+
+            try:
+                # put terminal in cbreak mode (character-by-character)
+                try:
+                    tty.setcbreak(fd)
+                except Exception:
+                    pass
+
+                while not self._stop.is_set():
+                    r, _, _ = select.select([fd], [], [], 0.03)
+                    if r:
+                        try:
+                            ch = os.read(fd, 1)
+                            if ch == b' ':
+                                self.pressed = True
+                                return
+                        except Exception:
+                            pass
+            finally:
+                # restore settings
+                if old is not None:
+                    try:
+                        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                    except Exception:
+                        pass
+                try:
+                    if fd not in (0, 1, 2):
+                        os.close(fd)
+                except Exception:
+                    pass
+        except Exception:
+            # quietly disable if environment doesn't allow key capture
+            return
+
+    def stop(self):
+        self._stop.set()
+        try:
+            self._thread.join(timeout=0.2)
+        except Exception:
+            pass
+
+
 # ---------- TTS ----------
 def which(cmd: str) -> bool:
     from shutil import which as _w
     return _w(cmd) is not None
 
 class TTS:
-    """Minimal TTS queue (macOS 'say' / Linux 'espeak' / fallback prints)."""
+    """Minimal TTS queue (macOS 'say' / Linux 'espeak' / fallback prints) with interrupt."""
     def __init__(self):
         self.available = False
         self.backend = None
         self.is_speaking = False
         self._lock = threading.Lock()
+        self._kill = threading.Event()
+        self._current_proc: Optional[subprocess.Popen] = None
+
         if platform.system() == "Darwin" and which("say"):
             self.available = True
             self.backend = ("say",)
         elif platform.system() == "Linux" and which("espeak"):
             self.available = True
             self.backend = ("espeak", "-s", "170", "-p", "40")
+
         self.q: "queue.Queue[str]" = queue.Queue()
         self.stop = threading.Event()
         threading.Thread(target=self._run, daemon=True).start()
@@ -237,21 +325,54 @@ class TTS:
         try:
             if not self.available:
                 print(f"\n{Colors.GRAY}🔊 {text}{Colors.RESET}\n", flush=True)
-                # simulate duration so Enter timing feels natural if needed
-                time.sleep(min(2.0, 0.04 * len(text)))
+                # simulate duration so space interrupt timing feels natural
+                for _ in range(int(max(1, len(text) * 0.02 / 0.05))):
+                    if self._kill.is_set() or self.stop.is_set():
+                        break
+                    time.sleep(0.05)
                 return
+            # start process
             if self.backend[0] == "say":
-                subprocess.run(["say", "-r", "180", text], check=False)
+                proc = subprocess.Popen(["say", "-r", "180", text])
             else:
-                subprocess.run([*self.backend, text], check=False)
+                proc = subprocess.Popen([*self.backend, text])
+            self._current_proc = proc
+            # poll with ability to interrupt
+            while proc.poll() is None and not self.stop.is_set() and not self._kill.is_set():
+                time.sleep(0.05)
+            if proc.poll() is None:
+                # still running but we were told to stop
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
         except Exception as e:
             print_status(f"TTS error: {e}", "error")
         finally:
+            self._current_proc = None
+            self._kill.clear()
             with self._lock:
                 self.is_speaking = False
 
     def say(self, text: str):
         self.q.put(text)
+
+    def stop_now(self):
+        """Immediately stop current speech and clear queued items."""
+        self._kill.set()
+        with self._lock:
+            if self._current_proc is not None:
+                try:
+                    self._current_proc.terminate()
+                except Exception:
+                    pass
+        # drain the queue
+        try:
+            while True:
+                self.q.get_nowait()
+                self.q.task_done()
+        except queue.Empty:
+            pass
 
     def is_currently_speaking(self) -> bool:
         with self._lock:
@@ -259,6 +380,7 @@ class TTS:
 
     def shutdown(self):
         self.stop.set()
+        self._kill.set()
         self.q.put(None)
 
 # ---------- Voice (mic capture + faster-whisper) ----------
@@ -328,25 +450,27 @@ class VoiceASR:
         def _enter_waiter():
             nonlocal stop
             try:
-                import sys
-                import termios
-                import tty
-                import select
+                import sys, termios, tty, select
                 fd = sys.stdin.fileno()
-                old_settings = termios.tcgetattr(fd)
+                old = termios.tcgetattr(fd)
                 try:
-                    tty.setraw(fd)
+                    tty.setcbreak(fd)
                     while not stop:
-                        rlist, _, _ = select.select([fd], [], [], 0.1)
-                        if rlist:
+                        r, _, _ = select.select([sys.stdin], [], [], 0.05)
+                        if r:
                             ch = sys.stdin.read(1)
-                            if ch in ('\r', '\n', ' '):  # Enter or Space
+                            if ch in ('\n', '\r', ' '):  # Enter or Space
                                 stop = True
                                 break
                 finally:
-                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old)
             except Exception:
-                pass
+                # fallback: blocking input
+                try:
+                    input()
+                    stop = True
+                except Exception:
+                    pass
 
         threading.Thread(target=_enter_waiter, daemon=True).start()
 
@@ -391,7 +515,7 @@ class VoiceASR:
 
         print_status("Transcribing audio...", "info")
         try:
-            segments, info = self.model.transcribe(
+            segments, _info = self.model.transcribe(
                 arr,
                 language="en",
                 beam_size=5,
@@ -410,7 +534,6 @@ class VoiceASR:
                 if t:
                     parts.append(t.strip())
             text = " ".join(parts).strip()
-            # Don't collapse spaces here; Whisper already returns clean segments.
             return text or None
         except Exception as e:
             print_status(f"Whisper transcription error: {e}", "error")
@@ -436,15 +559,14 @@ class Bot:
         else:
             print_status("No images found in /images/ directory", "warning")
 
+        # quick probe (kept quiet; errors show clearly)
         try:
-            print_status("Testing Claude connection...", "info")
-            r = self.client.messages.create(
+            _ = self.client.messages.create(
                 model=MODEL, max_tokens=5,
-                messages=[{"role":"user","content":"Say OK"}]
+                messages=[{"role":"user","content":"OK"}]
             )
-            print_status(f"Connection test successful: {r.content[0].text.strip()}", "success")
         except Exception as e:
-            print_status(f"Connection test failed: {e}", "error")
+            print_status(f"Claude connection failed: {e}", "error")
             sys.exit(1)
 
     def _enqueue_complete_sentences(self, buf: str) -> str:
@@ -491,7 +613,9 @@ class Bot:
         tts_buf = ""
         full_chunks: List[str] = []
         got_text = False
+        interrupted = False
 
+        watcher = SpacebarWatcher()
         try:
             with self.client.messages.stream(
                 model=MODEL,
@@ -501,11 +625,14 @@ class Bot:
                 messages=msgs,
             ) as stream:
                 for chunk in stream.text_stream:
+                    if watcher.pressed:
+                        interrupted = True
+                        break
                     if not chunk:
                         continue
                     got_text = True
 
-                    # display: remove *stage directions* but DO NOT collapse whitespace
+                    # display: strip *stage directions* but DO NOT collapse whitespace
                     display_chunk = clean_text_for_display(chunk)
                     if display_chunk:
                         typewriter_print(display_chunk, Colors.YELLOW, delay=0.01)
@@ -515,8 +642,22 @@ class Bot:
                     tts_buf = self._enqueue_complete_sentences(tts_buf)
 
                     full_chunks.append(chunk)
+
+                # if we broke due to spacebar, explicitly close stream
+                stream.close()
         except Exception as e:
             print_status(f"Streaming error: {type(e).__name__}: {e}", "error")
+            watcher.stop()
+            return
+        finally:
+            watcher.stop()
+
+        if interrupted:
+            # stop any ongoing speech and drop buffered/queued lines
+            self.tts.stop_now()
+            print_status("⎵ Interrupted", "warning")
+            # do not append leftover partial sentence or finalize full text
+            print()  # newline after the partial output
             return
 
         if not got_text:
@@ -528,7 +669,6 @@ class Bot:
                     messages=msgs,
                 )
                 txt = r.content[0].text
-                # display without collapsing whitespace
                 typewriter_print(clean_text_for_display(txt), Colors.YELLOW, delay=0.01)
                 # TTS on sentence boundaries
                 for s in self.sent_re.findall(txt):
@@ -560,7 +700,8 @@ class Bot:
 
 # ---------- CLI ----------
 def parse_args():
-    p = argparse.ArgumentParser(description="Enhanced Claude Chatbot with Voice & Vision")
+    import argparse as _argparse
+    p = _argparse.ArgumentParser(description="Enhanced Claude Chatbot with Voice & Vision")
     p.add_argument("--say", help="Send one message non-interactively and exit")
     p.add_argument("--voice", action="store_true", help="Voice mode: record + transcribe locally, then chat")
     p.add_argument("--list-images", action="store_true", help="List available images and exit")
