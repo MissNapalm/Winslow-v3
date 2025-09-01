@@ -132,6 +132,35 @@ class UltraFastTranscriber:
                 # Clean up any empty messages from loaded data
                 self._cleanup_memory()
                 print("🧠 Loaded conversation memory.")
+            
+            # Try to load memories.json for additional context about past interactions
+            memories_path = "memories.json"
+            if os.path.exists(memories_path):
+                try:
+                    with open(memories_path, "r", encoding="utf-8") as f:
+                        memories_data = json.load(f)
+                    
+                    # Extract facts from memories file
+                    facts = memories_data.get("facts", [])
+                    if facts:
+                        fact_summary = "\n\nUser facts from previous conversations:\n" + "\n".join(f"- {fact}" for fact in facts)
+                        self.running_summary += fact_summary
+                        print(f"🧠 Loaded {len(facts)} facts from memories.json")
+                    
+                    # If history is empty, import some past messages
+                    if not self.history:
+                        past_messages = memories_data.get("messages", [])
+                        if past_messages:
+                            # Import up to 10 recent message pairs (20 messages total)
+                            imported_count = min(20, len(past_messages))
+                            recent_messages = past_messages[-imported_count:]
+                            
+                            # Add these to history
+                            self.history.extend(recent_messages)
+                            print(f"🧠 Imported {imported_count} messages from memories.json")
+                except Exception as e:
+                    print(f"⚠️ Error loading memories.json: {e}")
+                    
         except Exception as e:
             print(f"⚠️ Could not load memory: {e}")
             self.history = []
@@ -266,6 +295,25 @@ class UltraFastTranscriber:
                     prompt = file.read().strip()
                     if prompt:
                         print(f"✅ Loaded character prompt from {prompt_file_path}")
+                        
+                        # Check if memories.json exists to augment the prompt
+                        memories_path = "memories.json"
+                        if os.path.exists(memories_path):
+                            try:
+                                with open(memories_path, 'r', encoding='utf-8') as f:
+                                    memories_data = json.load(f)
+                                
+                                # Extract facts from memories.json
+                                facts = memories_data.get("facts", [])
+                                if facts:
+                                    facts_str = "\n\nImportant facts about our past interactions:\n" + "\n".join(f"- {fact}" for fact in facts[:5])
+                                    
+                                    # Add memory context to prompt
+                                    prompt += facts_str
+                                    print(f"✅ Added {len(facts[:5])} memory facts to prompt")
+                            except Exception as e:
+                                print(f"⚠️ Error processing memories.json: {e}")
+                        
                         return prompt
             return "You are a helpful AI assistant. Keep responses concise and conversational."
         except Exception as e:
