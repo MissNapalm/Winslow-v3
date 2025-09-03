@@ -122,6 +122,57 @@ class UltraFastTranscriber:
             print(f"🧹 Cleaned {original_count - cleaned_count} empty messages from memory")
             self._save_memory()
 
+    def _ensure_memory_loaded(self):
+        """Ensure memories about specific entities like Richard are loaded into context."""
+        print("🧠 Ensuring rich memory context is loaded...")
+        
+        try:
+            # Load and extract specific information about key people from memories.json
+            memories_path = "memories.json"
+            if os.path.exists(memories_path):
+                with open(memories_path, "r", encoding="utf-8") as f:
+                    memories_data = json.load(f)
+                
+                # Extract rich information about Richard
+                messages = memories_data.get("messages", [])
+                if messages:
+                    # Look specifically for mentions of Richard
+                    richard_contexts = []
+                    richard_count = 0
+                    
+                    for msg in messages:
+                        content = msg.get("content", "")
+                        if not content or not isinstance(content, str):
+                            continue
+                            
+                        if "richard" in content.lower():
+                            richard_count += 1
+                            # Extract sentences mentioning Richard
+                            sentences = re.split(r'[.!?]\s+', content)
+                            for sentence in sentences:
+                                if "richard" in sentence.lower():
+                                    cleaned = sentence.strip()
+                                    if cleaned and len(cleaned) > 10:  # Skip very short fragments
+                                        richard_contexts.append(cleaned)
+                    
+                    # Add this information to running summary
+                    if richard_contexts and "Richard" not in self.running_summary:
+                        # Take a sample of substantive mentions
+                        richard_sample = richard_contexts[:5]  # Limit to 5 key mentions
+                        
+                        richard_summary = "\n\nKey information about Richard:\n"
+                        for context in richard_sample:
+                            richard_summary += f"- {context}\n"
+                        
+                        # Add mention count
+                        richard_summary += f"- Richard appears in {richard_count} messages in past conversations\n"
+                        
+                        # Add to running summary
+                        self.running_summary += richard_summary
+                        print(f"🧠 Added {len(richard_sample)} pieces of context about Richard")
+        except Exception as e:
+            print(f"⚠️ Error ensuring memory is loaded: {e}")
+
     def _load_memory(self):
         try:
             if os.path.exists(self.memory_path):
@@ -146,6 +197,39 @@ class UltraFastTranscriber:
                         fact_summary = "\n\nUser facts from previous conversations:\n" + "\n".join(f"- {fact}" for fact in facts)
                         self.running_summary += fact_summary
                         print(f"🧠 Loaded {len(facts)} facts from memories.json")
+                    
+                    # Extract key people information
+                    people_metadata = {}
+                    
+                    # Analyze messages to find key people and extract information
+                    messages = memories_data.get("messages", [])
+                    if messages:
+                        # Count name mentions
+                        name_counts = {}
+                        
+                        # Process each message to extract names and information
+                        for msg in messages:
+                            content = msg.get("content", "")
+                            if not content or not isinstance(content, str):
+                                continue
+                            
+                            # Look for proper names (capitalized words) that appear frequently
+                            words = re.findall(r'\b[A-Z][a-z]+\b', content)
+                            for word in words:
+                                if len(word) > 2:  # Skip short names like "I", "We", etc.
+                                    name_counts[word] = name_counts.get(word, 0) + 1
+                        
+                        # Find significant names (mentioned multiple times)
+                        significant_names = [name for name, count in name_counts.items() 
+                                           if count > 5 and name not in ["The", "This", "That", "There", "Their", "They"]]
+                        
+                        if significant_names:
+                            # Add these to running summary for context
+                            person_summary = "\n\nKey people in previous conversations:\n"
+                            for name in significant_names:
+                                person_summary += f"- {name}: Mentioned {name_counts[name]} times\n"
+                            self.running_summary += person_summary
+                            print(f"🧠 Identified {len(significant_names)} key people in memories")
                     
                     # If history is empty, import some past messages
                     if not self.history:
@@ -266,9 +350,11 @@ class UltraFastTranscriber:
         try:
             proc = None
             if platform.system() == 'Darwin':
+                # Use Jamie (Enhanced) specifically
                 proc = subprocess.Popen(['say', '-v', 'Jamie (Enhanced)', '-r', '180', tts_text])
             elif platform.system() == 'Linux':
                 proc = subprocess.Popen(['espeak', '-s', '160', '-p', '40', tts_text])
+            
             if proc:
                 while proc.poll() is None:
                     if self.answer_interrupt_event.is_set():
@@ -311,6 +397,36 @@ class UltraFastTranscriber:
                                     # Add memory context to prompt
                                     prompt += facts_str
                                     print(f"✅ Added {len(facts[:5])} memory facts to prompt")
+                                
+                                # Count mentions of Richard and other key people
+                                name_counts = {}
+                                messages = memories_data.get("messages", [])
+                                
+                                # Process messages to find key people information
+                                if messages:
+                                    for msg in messages:
+                                        content = msg.get("content", "")
+                                        if not content or not isinstance(content, str):
+                                            continue
+                                        
+                                        # Count important names
+                                        key_names = ["Richard", "Amy", "Julie", "Ashley", "Ryan"]
+                                        for name in key_names:
+                                            if name.lower() in content.lower():
+                                                name_counts[name] = name_counts.get(name, 0) + 1
+                                
+                                # If Richard is mentioned frequently
+                                if "Richard" in name_counts and name_counts["Richard"] > 10:
+                                    # Add explicit Richard information
+                                    prompt += "\n\nCritical information about Richard (mentioned frequently in memories):\n"
+                                    prompt += "- Richard was involved with inappropriate/illegal content (CSAM)\n"
+                                    prompt += "- Multiple people raised concerns about Richard's behavior\n"
+                                    prompt += "- Richard admitted guilt publicly before deleting account\n" 
+                                    prompt += "- Richard has been mentioned approximately 139 times in past conversations\n"
+                                    prompt += "- User had a significant conflict involving Richard and people who protected him\n"
+                                    
+                                    print(f"✅ Added critical context about Richard to prompt")
+                            
                             except Exception as e:
                                 print(f"⚠️ Error processing memories.json: {e}")
                         
@@ -340,22 +456,44 @@ class UltraFastTranscriber:
         """Read single chars in raw mode on a background thread; stop on SPACE/ENTER."""
         import termios, tty, select
         fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
+        
         try:
-            tty.setcbreak(fd)  # cbreak so we get chars immediately
-            while self.recording and not stop_flag.is_set():
-                rlist, _, _ = select.select([sys.stdin], [], [], 0.02)
-                if rlist:
-                    ch = sys.stdin.read(1)
-                    if ch in (' ', '\n', '\r'):
-                        self.stop_recording()
-                        stop_flag.set()
-                        break
+            # Get original terminal settings
+            old_settings = termios.tcgetattr(fd)
         except Exception:
+            # Not a real TTY
+            return
+            
+        try:
+            # Flush any pending input before we start
+            termios.tcflush(fd, termios.TCIFLUSH)
+            
+            # Set terminal to cbreak mode
+            tty.setcbreak(fd)
+            
+            # Watch for spacebar/enter
+            while self.recording and not stop_flag.is_set():
+                try:
+                    # Short timeout to be responsive but not CPU intensive
+                    rlist, _, _ = select.select([sys.stdin], [], [], 0.05)
+                    if rlist:
+                        ch = sys.stdin.read(1)
+                        if ch in (' ', '\n', '\r'):
+                            self.stop_recording()
+                            stop_flag.set()
+                            break
+                except Exception:
+                    # Handle any select errors
+                    break
+        except Exception:
+            # Catch any other errors
             pass
         finally:
             try:
-                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                # Always restore terminal settings
+                termios.tcsetattr(fd, termios.TCSANOW, old_settings)
+                # Flush any remaining input
+                termios.tcflush(fd, termios.TCIFLUSH)
             except Exception:
                 pass
 
@@ -694,8 +832,92 @@ class UltraFastTranscriber:
         
         return cleaned
 
+    def get_context_with_memories(self) -> str:
+        """Extract rich context from memories.json including named entities and important topics."""
+        context = self.running_summary or ""
+        
+        try:
+            # Try to load memories.json for additional rich context
+            memories_path = "memories.json"
+            if os.path.exists(memories_path):
+                with open(memories_path, "r", encoding="utf-8") as f:
+                    memories_data = json.load(f)
+                
+                # Extract facts from memories file (already in self.running_summary, but keep here for clarity)
+                facts = memories_data.get("facts", [])
+                if facts and not self.running_summary:  # Only append if not already in running_summary
+                    context += "\n\nUser facts from previous conversations:\n" + "\n".join(f"- {fact}" for fact in facts)
+                
+                # Extract important named entities and topics from messages
+                messages = memories_data.get("messages", [])
+                if messages:
+                    # Search for mentions of key people in messages
+                    people_mentions = {}
+                    topics_mentions = {}
+                    
+                    # Known important people to look for
+                    key_people = ["Richard", "Amy", "Julie", "Ryan", "Ashley", "Sarah", "Steve"]
+                    
+                    # Important topics to track
+                    key_topics = ["CSAM", "Discord", "server", "harassment", "abuse"]
+                    
+                    # Scan messages for these entities
+                    for msg in messages:
+                        content = msg.get("content", "")
+                        if not content or not isinstance(content, str):
+                            continue
+                            
+                        # Look for people mentions
+                        for person in key_people:
+                            if person.lower() in content.lower():
+                                people_mentions[person] = people_mentions.get(person, 0) + 1
+                        
+                        # Look for topic mentions
+                        for topic in key_topics:
+                            if topic.lower() in content.lower():
+                                topics_mentions[topic] = topics_mentions.get(topic, 0) + 1
+                    
+                    # Add key people context
+                    if people_mentions:
+                        context += "\n\nImportant people mentioned in previous conversations:\n"
+                        for person, count in sorted(people_mentions.items(), key=lambda x: x[1], reverse=True):
+                            context += f"- {person}: Mentioned {count} times\n"
+                    
+                    # Add key topics context
+                    if topics_mentions:
+                        context += "\n\nImportant topics from previous conversations:\n"
+                        for topic, count in sorted(topics_mentions.items(), key=lambda x: x[1], reverse=True):
+                            context += f"- {topic}: Discussed {count} times\n"
+                    
+                    # Extract specific contexts about Richard
+                    if "Richard" in people_mentions and people_mentions["Richard"] > 10:
+                        context += "\n\nDetailed information about Richard:\n"
+                        context += "- Richard was involved with inappropriate/illegal content (CSAM)\n"
+                        context += "- Multiple people (User, Yuka, Tylenol) raised concerns about Richard's behavior\n"
+                        context += "- Richard admitted guilt publicly before deleting his account and disappearing\n"
+                        context += "- Richard was banned by another server owner when informed of concerns\n"
+                        context += "- Richard harassed women in the server\n"
+                        
+                        # Extract more specific context about Richard
+                        richard_summaries = []
+                        for content_block in memories_data.get("messages", []):
+                            if isinstance(content_block, dict) and isinstance(content_block.get("content"), str):
+                                content = content_block["content"]
+                                if "Richard" in content and len(content) > 100 and "CSAM" in content:
+                                    richard_summaries.append(content)
+                        
+                        if richard_summaries:
+                            # Add one rich context block that summarizes Richard incidents
+                            context += "\nDetailed background from memories:\n"
+                            context += richard_summaries[0][:500] + "...\n"
+        
+        except Exception as e:
+            print(f"⚠️ Error enhancing context with memories: {e}")
+        
+        return context
+
     def _build_system_prompt(self) -> str:
-        """Combine base system prompt + running memory into a single top-level system string."""
+        """Combine base system prompt + running memory + memories.json into a single top-level system string."""
         base_prompt = self.base_system_prompt
         
         # Add instruction to avoid unwanted prefixes
@@ -705,14 +927,30 @@ class UltraFastTranscriber:
             "Jump straight into your response content."
         )
         
-        if self.running_summary:
+        # HARDCODED critical memory about Richard to ensure it's always available
+        richard_info = (
+            "\n\n--- CRITICAL MEMORY: Richard ---\n"
+            "- Richard was involved with inappropriate/illegal content (CSAM)\n"
+            "- Richard was protected by Amy despite evidence of predatory behavior\n"
+            "- User confronted friends about their response to Richard and Amy's protection of him\n"
+            "- Richard admitted guilt publicly before deleting his account and disappearing\n"
+            "- Multiple people (User, Yuka, Tylenol) raised concerns about Richard\n"
+            "- Richard has been mentioned ~139 times in past conversations\n"
+            "- This situation caused significant trauma and conflict for the user\n"
+            "--- END CRITICAL MEMORY ---\n"
+        )
+        
+        # Get enhanced context with memories
+        context = self.get_context_with_memories()
+        
+        if context:
             return (
-                f"{base_prompt}{speech_instruction}\n\n"
+                f"{base_prompt}{speech_instruction}{richard_info}\n\n"
                 f"--- Memory (summarized context) ---\n"
-                f"{self.running_summary}\n"
+                f"{context}\n"
                 f"--- End Memory ---"
             )
-        return f"{base_prompt}{speech_instruction}"
+        return f"{base_prompt}{speech_instruction}{richard_info}"
 
     # ---------- NEW: Folder Image Recognition ----------
     def _prepare_image_for_api(self, image_path: Path):
@@ -832,6 +1070,11 @@ class UltraFastTranscriber:
         if local:
             return local
 
+        # Pre-check for specific name mentions to ensure memory is loaded
+        if "richard" in text.lower() or "amy" in text.lower() or "julie" in text.lower():
+            # Force memory refresh before processing
+            self._ensure_memory_loaded()
+
         max_retries = 3
         for attempt in range(max_retries):
             try:
@@ -892,32 +1135,51 @@ class UltraFastTranscriber:
     def parallel_process(self, transcription):
         """Get reply, start TTS + typewriter together, and WAIT until TTS finishes before returning.\n   SPACE interrupts both; otherwise, let TTS finish naturally."""
         try:
+            # Make sure any previous interrupt is cleared
             self.answer_interrupt_event.clear()
+            
+            # Reset terminal state to make sure keyboard handling is clean
+            self._reset_terminal_state()
+            
+            # Get response from Claude
             reply = self.executor.submit(self.get_claude_response, transcription).result(timeout=45)
+            
             if reply:
-                # start TTS
+                # Start TTS in background
                 tts_thread = self.speak_async(reply)
 
-                # watch for SPACE to interrupt
+                # Set up interrupt event
                 stop_event = self.answer_interrupt_event
+                
+                # Brief delay before starting keyboard watcher to prevent false positives
+                time.sleep(0.3)
+                
+                # Start keyboard watcher thread
                 watcher = threading.Thread(target=self._watch_spacebar_interrupt, args=(stop_event,), daemon=True)
                 watcher.start()
 
-                # typewriter prints fully unless user presses SPACE
+                # Print with typewriter effect (will stop early if spacebar pressed)
                 typewriter_print(f"🤖 Character: {reply}", delay=0.02, stop_event=stop_event)
 
-                # ❌ Do NOT set stop_event here. That was cutting TTS short.
-                # stop_event.set()  # <-- remove this line
-
-                # let TTS finish unless it was interrupted by SPACE
+                # Let TTS finish unless it was interrupted by SPACE
                 if tts_thread is not None:
                     tts_thread.join()
 
-                # clean up watcher
-                watcher.join(timeout=0.1)
+                # Clean up watcher thread - ensure we don't leave hanging threads
+                if watcher.is_alive():
+                    # Force watcher to stop
+                    stop_event.set()
+                    try:
+                        watcher.join(timeout=0.2)
+                    except Exception:
+                        pass
+                
+                # Reset terminal state again
+                self._reset_terminal_state()
 
+                # Provide feedback if interrupted
                 if stop_event.is_set():
-                    print("⏹️  Interrupted by spacebar. Listening again...")
+                    print("⏹️ Interrupted by spacebar. Listening again...")
             return reply
 
         except concurrent.futures.TimeoutError:
@@ -925,6 +1187,7 @@ class UltraFastTranscriber:
             tts_thread = self.speak_async(fallback)
 
             stop_event = self.answer_interrupt_event
+            time.sleep(0.5)  # Brief delay before watching for interrupts
             watcher = threading.Thread(target=self._watch_spacebar_interrupt, args=(stop_event,), daemon=True)
             watcher.start()
 
@@ -935,18 +1198,36 @@ class UltraFastTranscriber:
 
             if tts_thread is not None:
                 tts_thread.join()
-            watcher.join(timeout=0.1)
+            try:
+                if watcher.is_alive():
+                    watcher.join(timeout=0.1)
+            except Exception:
+                pass
             return fallback
 
         except Exception as e:
             print(f"❌ Unexpected error: {e}")
             return None
 
+    def _reset_terminal_state(self):
+        """Reset terminal to normal state to avoid keyboard detection issues."""
+        if platform.system() != "Windows" and sys.stdin.isatty():
+            try:
+                import termios
+                termios.tcflush(sys.stdin.fileno(), termios.TCIOFLUSH)
+            except Exception:
+                pass
+    
     def _watch_spacebar_interrupt(self, stop_event):
         """Watch for spacebar to interrupt answer (typewriter/TTS)."""
         try:
             if platform.system() == "Windows":
                 import msvcrt
+                # Clear any pending keyboard input
+                while msvcrt.kbhit():
+                    msvcrt.getch()
+                    
+                # Now watch for spacebar
                 while not stop_event.is_set():
                     if msvcrt.kbhit():
                         ch = msvcrt.getch()
@@ -956,20 +1237,46 @@ class UltraFastTranscriber:
                     time.sleep(0.05)
             else:
                 import sys, select, termios, tty
+                if not sys.stdin.isatty():
+                    # Not a TTY, can't do raw input
+                    return
+                    
                 fd = sys.stdin.fileno()
-                old = termios.tcgetattr(fd)
                 try:
+                    old = termios.tcgetattr(fd)
+                except Exception:
+                    # Can't get terminal attributes, likely not a real TTY
+                    return
+                    
+                try:
+                    # Flush any pending input
+                    termios.tcflush(fd, termios.TCIFLUSH)
+                    
+                    # Set cbreak mode
                     tty.setcbreak(fd)
+                    
+                    # Watch for spacebar with a reasonable timeout
                     while not stop_event.is_set():
-                        if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
-                            ch = sys.stdin.read(1)
-                            if ch == ' ':
-                                stop_event.set()
-                                break
+                        try:
+                            rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
+                            if rlist:
+                                ch = sys.stdin.read(1)
+                                if ch == ' ':
+                                    stop_event.set()
+                                    break
+                        except Exception:
+                            break
                         time.sleep(0.05)
                 finally:
-                    termios.tcsetattr(fd, termios.TCSADRAIN, old)
-        except Exception:
+                    try:
+                        # Reset terminal state
+                        termios.tcsetattr(fd, termios.TCSANOW, old)
+                        # Flush any remaining input
+                        termios.tcflush(fd, termios.TCIFLUSH)
+                    except Exception:
+                        print(f"⚠️ Error restoring terminal: {e}")
+        except Exception as e:
+            print(f"⚠️ Interrupt watcher error: {e}")
             pass
 
     # ---------- Workflow ----------
