@@ -70,6 +70,9 @@ class UltraFastTranscriber:
         
         # Initialize TTS
         self.setup_tts()
+        self.tts_enabled = True
+        self.active_tts_thread = None  # Keep track of current TTS thread
+        self.tts_lock = threading.Lock()  # Lock to prevent concurrent TTS threads
         
         # Load base system prompt from file
         self.base_system_prompt = self.load_prompt_from_file()
@@ -350,8 +353,8 @@ class UltraFastTranscriber:
         try:
             proc = None
             if platform.system() == 'Darwin':
-                # Use Jamie (Enhanced) specifically
-                proc = subprocess.Popen(['say', '-v', 'Jamie (Enhanced)', '-r', '180', tts_text])
+                # Use the system's currently selected voice
+                proc = subprocess.Popen(['say', tts_text])
             elif platform.system() == 'Linux':
                 proc = subprocess.Popen(['espeak', '-s', '160', '-p', '40', tts_text])
             
@@ -368,10 +371,23 @@ class UltraFastTranscriber:
             return False
 
     def speak_async(self, text):
-        """Start OS TTS in the background so it overlaps with the typewriter. Respects interruption."""
-        t = threading.Thread(target=self.speak_system, args=(text,), daemon=True)
-        t.start()
-        return t
+        """Start OS TTS in the background so it overlaps with the typewriter. Respects interruption.
+        Ensures only one TTS thread is active at a time."""
+        with self.tts_lock:
+            # First, stop any currently active TTS thread
+            if self.active_tts_thread is not None and self.active_tts_thread.is_alive():
+                self.answer_interrupt_event.set()  # Signal the thread to stop
+                try:
+                    self.active_tts_thread.join(timeout=0.5)  # Give it time to stop
+                except Exception:
+                    pass
+                self.answer_interrupt_event.clear()  # Reset the interrupt flag
+            
+            # Create and start a new TTS thread
+            t = threading.Thread(target=self.speak_system, args=(text,), daemon=True)
+            self.active_tts_thread = t
+            t.start()
+            return t
 
     # ---------- Prompt ----------
     def load_prompt_from_file(self, prompt_file_path="prompt.txt"):
@@ -1281,6 +1297,9 @@ class UltraFastTranscriber:
 
     # ---------- Workflow ----------
     def ultra_fast_workflow(self):
+        # Clear any lingering interrupt flags
+        self.answer_interrupt_event.clear()
+        
         # Start recording directly; stop via SPACE or Enter (raw), or Enter fallback
         self.audio_buffer = self.record_audio_optimized()
 
